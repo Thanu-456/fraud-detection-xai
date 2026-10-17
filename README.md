@@ -1,4 +1,11 @@
 # Explainable ML for UPI and Card Fraud Detection
+## Live demo
+https://securepay-fraud.streamlit.app/
+
+Free hosting valla first request ki ~1 minute paduthundi (API sleep nundi lestundi). Demo app: money fake, dummy password vadandi.
+
+![Approved](reports/figures/app_approved.png)
+![Blocked](reports/figures/app_blocked.png)
 
 Fraud detection with XGBoost and SHAP, plus a simulated real-time scoring flow (FastAPI + Streamlit) where users log in, send money, and see why a transaction was approved or blocked.
 
