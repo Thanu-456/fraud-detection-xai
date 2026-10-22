@@ -21,12 +21,31 @@ def _cfg(key, default=""):
         return default
 
 
-# API address: defaults to local; when deployed it comes from Secrets / environment variables
-API_BASE = _cfg("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-API_URL = f"{API_BASE}/predict"
-CARD_API_URL = f"{API_BASE}/predict-card"
+# Optional: only this username becomes admin (if empty, the first registered user is admin)
 ADMIN_USERNAME = _cfg("ADMIN_USERNAME").strip().lower()
-API_TIMEOUT = 90  # free hosting takes time to wake the API up from sleep
+
+# Address of the FastAPI service (api/main.py)
+API_URL = _cfg("API_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def fraud_score(kind, feats, threshold):
+    """Send the features to the FastAPI service and return its JSON result."""
+    path = "/predict" if kind == "upi" else "/predict-card"
+    try:
+        resp = requests.post(f"{API_URL}{path}", params={"threshold": threshold},
+                             json=feats, timeout=60)
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            f"Cannot reach the fraud API at {API_URL}. "
+            "Start it with: uvicorn api.main:app --host 127.0.0.1 --port 8000")
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"API error {resp.status_code}: {detail}")
+    return resp.json()
+
 
 DB = "data/app.db"
 THRESHOLD = 0.5
@@ -111,22 +130,10 @@ def init_db():
 init_db()
 
 
-# ---------------- API error handling ----------------
+# ---------------- Error handling ----------------
 def api_error_message(e):
-    """Turn a raw requests exception into a short, readable message."""
-    if isinstance(e, requests.exceptions.ConnectionError):
-        return (f"Could not connect to the Fraud API at {API_BASE}. "
-                "Make sure the backend is running "
-                "(for example: uvicorn main:app --host 127.0.0.1 --port 8000) "
-                "and try again.")
-    if isinstance(e, requests.exceptions.Timeout):
-        return ("The Fraud API took too long to respond. "
-                "If it is hosted on a free plan it may be waking up. "
-                "Please wait a moment and try again.")
-    if isinstance(e, requests.exceptions.HTTPError):
-        code = e.response.status_code if e.response is not None else "unknown"
-        return f"The Fraud API returned an error (HTTP {code}). Please check the API logs."
-    return f"Unexpected error: {e}"
+    """Short, readable message when scoring fails."""
+    return f"Could not score the transaction: {e}"
 
 
 # ---------------- Auth ----------------
@@ -188,9 +195,7 @@ def build_features(user, receiver, amount, device_changed, location_mismatch):
 
 def send_money(user, receiver, amount, device_changed, location_mismatch):
     feats = build_features(user, receiver, amount, device_changed, location_mismatch)
-    resp = requests.post(f"{API_URL}?threshold={THRESHOLD}", json=feats, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    r = resp.json()
+    r = fraud_score("upi", feats, THRESHOLD)
     status = "BLOCKED" if r["decision"] == "FRAUD" else "APPROVED"
     with db() as c:
         c.execute(
@@ -259,9 +264,7 @@ def build_card_features(user, category, city, amount, online, foreign):
 
 def card_pay(user, merchant, category, city, amount, online, foreign):
     feats = build_card_features(user, category, city, amount, online, foreign)
-    resp = requests.post(f"{CARD_API_URL}?threshold={THRESHOLD}", json=feats, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    r = resp.json()
+    r = fraud_score("card", feats, THRESHOLD)
     status = "BLOCKED" if r["decision"] == "FRAUD" else "APPROVED"
     with db() as c:
         c.execute(
