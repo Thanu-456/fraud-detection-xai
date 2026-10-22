@@ -9,24 +9,36 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# API address: local lo default, deploy appudu environment variable nundi vastundi
-API_BASE = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+def _cfg(key, default=""):
+    """Read a value from an environment variable, falling back to Streamlit Secrets."""
+    value = os.environ.get(key)
+    if value:
+        return value
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+
+# API address: defaults to local; when deployed it comes from Secrets / environment variables
+API_BASE = _cfg("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 API_URL = f"{API_BASE}/predict"
 CARD_API_URL = f"{API_BASE}/predict-card"
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").strip().lower()
-API_TIMEOUT = 90  # free hosting lo API sleep nundi lechestappudu time paduthundi
+ADMIN_USERNAME = _cfg("ADMIN_USERNAME").strip().lower()
+API_TIMEOUT = 90  # free hosting takes time to wake the API up from sleep
 
 DB = "data/app.db"
 THRESHOLD = 0.5
 
 REASON_TEXT = {
-    "device_changed": "Kotha device nundi transaction",
-    "new_receiver": "Kotha receiver (mundu pay cheyaledu)",
-    "location_mismatch": "Usual location kaadu",
-    "amount": "Amount chala ekkuva",
-    "hour": "Raatri time lo transaction",
-    "account_age_days": "Account chala kotha",
-    "txn_count_24h": "24 gantallo chala transactions",
+    "device_changed": "Transaction from a new device",
+    "new_receiver": "New receiver (never paid before)",
+    "location_mismatch": "Not the usual location",
+    "amount": "Unusually high amount",
+    "hour": "Transaction at night time",
+    "account_age_days": "Very new account",
+    "txn_count_24h": "Too many transactions in 24 hours",
 }
 
 CATEGORIES = {"Grocery": 0.0, "Restaurant": 0.1, "Fuel": 0.2, "ATM": 0.4,
@@ -37,14 +49,14 @@ CITIES = {"Hyderabad": (17.385, 78.487), "Bengaluru": (12.972, 77.595),
           "Delhi": (28.614, 77.209)}
 
 CARD_REASON_TEXT = {
-    "amount_vs_avg": "Mee normal spending kante chala ekkuva amount",
-    "amount": "Amount chala ekkuva",
-    "txn_count_1h": "Oka gantalo chala transactions",
-    "minutes_since_last": "Last transaction ki chala daggara time lo",
-    "distance_from_last_km": "Last transaction nundi chala dooram",
-    "travel_speed_kmh": "Impossible travel (anta speed lo travel saadhyam kaadu)",
+    "amount_vs_avg": "Amount much higher than your normal spending",
+    "amount": "Unusually high amount",
+    "txn_count_1h": "Too many transactions in one hour",
+    "minutes_since_last": "Too soon after the last transaction",
+    "distance_from_last_km": "Very far from the last transaction",
+    "travel_speed_kmh": "Impossible travel (speed not physically possible)",
     "merchant_risk": "Risky merchant category",
-    "is_online": "Online payment (card present kaadu)",
+    "is_online": "Online payment (card not present)",
     "is_foreign": "International merchant",
 }
 
@@ -99,6 +111,24 @@ def init_db():
 init_db()
 
 
+# ---------------- API error handling ----------------
+def api_error_message(e):
+    """Turn a raw requests exception into a short, readable message."""
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return (f"Could not connect to the Fraud API at {API_BASE}. "
+                "Make sure the backend is running "
+                "(for example: uvicorn main:app --host 127.0.0.1 --port 8000) "
+                "and try again.")
+    if isinstance(e, requests.exceptions.Timeout):
+        return ("The Fraud API took too long to respond. "
+                "If it is hosted on a free plan it may be waking up. "
+                "Please wait a moment and try again.")
+    if isinstance(e, requests.exceptions.HTTPError):
+        code = e.response.status_code if e.response is not None else "unknown"
+        return f"The Fraud API returned an error (HTTP {code}). Please check the API logs."
+    return f"Unexpected error: {e}"
+
+
 # ---------------- Auth ----------------
 def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
@@ -107,13 +137,13 @@ def hash_pw(pw, salt):
 def register(username, pw):
     username = username.strip().lower()
     if len(username) < 3 or len(pw) < 6:
-        return False, "Username min 3 characters, password min 6 characters undali."
+        return False, "Username must be at least 3 characters and password at least 6 characters."
     salt = secrets.token_hex(8)
     with db() as c:
         if c.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            return False, "Ee username already undi."
+            return False, "This username already exists."
         n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        # ADMIN_USERNAME set chesthe aa username matrame admin. Lekapothe first user admin.
+        # If ADMIN_USERNAME is set, only that username becomes admin. Otherwise the first user does.
         is_first_admin = (username == ADMIN_USERNAME) if ADMIN_USERNAME else (n == 0)
         role = "admin" if is_first_admin else "user"
         c.execute(
@@ -121,7 +151,7 @@ def register(username, pw):
             (username, salt, hash_pw(pw, salt), role,
              datetime.now().isoformat(timespec="seconds")),
         )
-    return True, f"Account create ayyindi (role: {role}). Ippudu Login tab lo login cheyandi."
+    return True, f"Account created (role: {role}). Please log in using the Login tab."
 
 
 def login(username, pw):
@@ -277,12 +307,12 @@ if st.session_state.user is None:
                         st.session_state.user = user
                         st.rerun()
                     else:
-                        st.error("Username ledha password tappu.")
+                        st.error("Incorrect username or password.")
         with t_reg:
             with st.form("reg_form"):
                 u2 = st.text_input("Choose username")
                 p2 = st.text_input("Choose password", type="password")
-                st.caption("Demo app: asalu password pettakandi, dummy password vadandi.")
+                st.caption("Demo app: do not use a real password, use a dummy one.")
                 if st.form_submit_button("Create account"):
                     ok, msg = register(u2, p2)
                     (st.success if ok else st.error)(msg)
@@ -313,38 +343,38 @@ with tabs[0]:
         with st.form("send_form"):
             receiver = st.text_input("Receiver (UPI ID / name)")
             amount = st.number_input("Amount (Rs)", 1.0, 1_000_000.0, 500.0, key="upi_amount")
-            st.caption("Demo kosam: device mariyu location manual ga simulate chestam.")
-            dev = st.checkbox("New device nundi login (simulate)")
-            loc = st.checkbox("Different location nundi (simulate)")
+            st.caption("For the demo, device and location are simulated manually.")
+            dev = st.checkbox("Login from a new device (simulate)")
+            loc = st.checkbox("Login from a different location (simulate)")
             go = st.form_submit_button("Pay now", type="primary")
 
     with right:
         st.subheader("Result")
         if go:
             if not receiver.strip():
-                st.warning("Receiver enter cheyandi.")
+                st.warning("Please enter the receiver.")
             else:
                 try:
-                    with st.spinner("Checking transaction... (first request ki konchem time paduthundi)"):
+                    with st.spinner("Checking transaction... (the first request may take a little longer)"):
                         r, status = send_money(user, receiver.strip().lower(), amount, dev, loc)
                 except Exception as e:
-                    st.error(f"Fraud API ki connect avvaledu. Konchem sepu aagi malli try cheyandi. ({e})")
+                    st.error(api_error_message(e))
                 else:
                     m1, m2 = st.columns(2)
                     m1.metric("Fraud probability", f"{r['fraud_probability']:.1%}")
                     m2.metric("Status", status)
                     result_card(status == "BLOCKED",
                                 "🚨 TRANSACTION BLOCKED",
-                                "Suspicious activity detect ayyindi. Money pampabadaledu.",
+                                "Suspicious activity detected. The money was not sent.",
                                 "✅ PAYMENT SUCCESSFUL",
-                                f"Rs {amount:,.2f} pampabadindi.")
+                                f"Rs {amount:,.2f} has been sent.")
                     risky = [x for x in r["top_reasons"] if x["impact"] > 0]
                     if risky:
-                        st.markdown("**Enduku ee risk?**")
+                        st.markdown("**Why is this risky?**")
                         for x in risky:
                             st.write("⚠️", REASON_TEXT.get(x["feature"], x["feature"]))
         else:
-            st.info("Details enter chesi 'Pay now' click cheyandi.")
+            st.info("Enter the details and click 'Pay now'.")
 
 # ----- Card payment -----
 with tabs[1]:
@@ -356,7 +386,7 @@ with tabs[1]:
             category = st.selectbox("Merchant category", list(CATEGORIES.keys()))
             city = st.selectbox("Transaction city", list(CITIES.keys()))
             c_amount = st.number_input("Amount (Rs)", 1.0, 1_000_000.0, 1500.0, key="card_amount")
-            online = st.checkbox("Online payment (card present kaadu)")
+            online = st.checkbox("Online payment (card not present)")
             foreign = st.checkbox("International merchant")
             pay = st.form_submit_button("Pay by card", type="primary")
 
@@ -364,42 +394,42 @@ with tabs[1]:
         st.subheader("Result")
         if pay:
             if not merchant.strip():
-                st.warning("Merchant name enter cheyandi.")
+                st.warning("Please enter the merchant name.")
             else:
                 try:
-                    with st.spinner("Checking card payment... (first request ki konchem time paduthundi)"):
+                    with st.spinner("Checking card payment... (the first request may take a little longer)"):
                         r, status, feats = card_pay(user, merchant.strip(), category, city,
                                                     c_amount, online, foreign)
                 except Exception as e:
-                    st.error(f"Fraud API ki connect avvaledu. Konchem sepu aagi malli try cheyandi. ({e})")
+                    st.error(api_error_message(e))
                 else:
                     m1, m2 = st.columns(2)
                     m1.metric("Fraud probability", f"{r['fraud_probability']:.1%}")
                     m2.metric("Status", status)
                     result_card(status == "BLOCKED",
                                 "🚨 CARD PAYMENT BLOCKED",
-                                "Suspicious activity detect ayyindi.",
+                                "Suspicious activity detected.",
                                 "✅ CARD PAYMENT APPROVED",
-                                f"Rs {c_amount:,.2f} charge ayyindi.")
+                                f"Rs {c_amount:,.2f} has been charged.")
                     risky = [x for x in r["top_reasons"] if x["impact"] > 0]
                     if risky:
-                        st.markdown("**Enduku ee risk?**")
+                        st.markdown("**Why is this risky?**")
                         for x in risky:
                             st.write("⚠️", CARD_REASON_TEXT.get(x["feature"], x["feature"]))
-                    st.markdown("**Automatic ga calculate ayina features**")
+                    st.markdown("**Automatically calculated features**")
                     st.dataframe(
                         pd.DataFrame({"Feature": list(feats.keys()),
                                       "Value": [round(v, 2) for v in feats.values()]}),
                         hide_index=True, use_container_width=True)
         else:
-            st.info("Details enter chesi 'Pay by card' click cheyandi.")
+            st.info("Enter the details and click 'Pay by card'.")
 
 # ----- My transactions -----
 with tabs[2]:
     st.subheader("My UPI transactions")
     mine = load_txns(user["username"])
     if mine.empty:
-        st.info("Inka UPI transactions levu.")
+        st.info("No UPI transactions yet.")
     else:
         c1, c2, c3 = st.columns(3)
         c1.metric("Total", len(mine))
@@ -412,7 +442,7 @@ with tabs[2]:
     st.subheader("My card transactions")
     mine_c = load_card_txns(user["username"])
     if mine_c.empty:
-        st.info("Inka card transactions levu.")
+        st.info("No card transactions yet.")
     else:
         c1, c2, c3 = st.columns(3)
         c1.metric("Total", len(mine_c))
@@ -439,7 +469,7 @@ if is_admin:
         ]:
             st.markdown(f"### {label} transactions")
             if data.empty:
-                st.info(f"Inka {label} transactions levu.")
+                st.info(f"No {label} transactions yet.")
                 continue
             blocked = data[data["status"] == "BLOCKED"]
             c1, c2, c3 = st.columns(3)
@@ -447,7 +477,7 @@ if is_admin:
             c2.metric("Blocked", len(blocked))
             c3.metric("Fraud rate", f"{len(blocked) / len(data):.1%}")
             if blocked.empty:
-                st.info("Inka blocked transactions levu.")
+                st.info("No blocked transactions yet.")
             else:
                 st.dataframe(blocked[cols], hide_index=True, use_container_width=True)
                 st.bar_chart(blocked["top_reason"].value_counts(), color="#EF4444")

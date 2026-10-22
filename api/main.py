@@ -1,465 +1,226 @@
-import hashlib
-import math
+"""
+SecurePay Fraud API (FastAPI)
+
+Endpoints used by the Streamlit app:
+    POST /predict?threshold=0.5        -> UPI fraud scoring
+    POST /predict-card?threshold=0.5   -> Card fraud scoring
+    GET  /health                       -> quick check that the API and models are OK
+
+Run from the project root (C:\\fraud-detection-xai):
+    uvicorn api.main:app --host 127.0.0.1 --port 8000
+"""
 import os
-import secrets
-import sqlite3
-from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 
+import joblib
+import numpy as np
 import pandas as pd
-import requests
-import streamlit as st
+import shap
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Folders searched for model files. Add your own folder here if needed,
+# or set the MODEL_DIR environment variable.
+MODEL_DIRS = [ROOT / "models", ROOT / "api", ROOT / "artifacts"]
+if os.environ.get("MODEL_DIR"):
+    MODEL_DIRS.insert(0, Path(os.environ["MODEL_DIR"]))
+
+# You can also point directly at the files:
+#   set UPI_MODEL_PATH=C:\fraud-detection-xai\models\upi_model.pkl
+#   set CARD_MODEL_PATH=C:\fraud-detection-xai\models\card_model.pkl
+ENV_PATHS = {"upi": "UPI_MODEL_PATH", "card": "CARD_MODEL_PATH"}
+
+MODEL_EXTENSIONS = {".joblib", ".pkl", ".json", ".ubj"}
+SKIP_WORDS = ("scaler", "explainer", "encoder", "metrics", "report", "feature_list")
+
+# Default feature order (matches what the Streamlit app sends).
+# If the saved model knows its own feature names, those are used instead.
+DEFAULT_FEATURES = {
+    "upi": ["amount", "hour", "account_age_days", "txn_count_24h",
+            "new_receiver", "device_changed", "location_mismatch"],
+    "card": ["amount", "amount_vs_avg", "txn_count_1h", "minutes_since_last",
+             "distance_from_last_km", "travel_speed_kmh", "merchant_risk",
+             "is_online", "is_foreign"],
+}
+
+app = FastAPI(title="SecurePay Fraud API")
 
 
-def _cfg(key, default=""):
-    """Environment variable nundi, lekapothe Streamlit Secrets nundi value teesukuntundi."""
-    value = os.environ.get(key)
-    if value:
-        return value
+# ---------------- Request schemas ----------------
+class UpiTxn(BaseModel):
+    amount: float
+    hour: int
+    account_age_days: int
+    txn_count_24h: int
+    new_receiver: int
+    device_changed: int
+    location_mismatch: int
+
+
+class CardTxn(BaseModel):
+    amount: float
+    amount_vs_avg: float
+    txn_count_1h: int
+    minutes_since_last: float
+    distance_from_last_km: float
+    travel_speed_kmh: float
+    merchant_risk: float
+    is_online: int
+    is_foreign: int
+
+
+# ---------------- Model loading ----------------
+def _find_model_file(kind):
+    env_name = ENV_PATHS[kind]
+    if os.environ.get(env_name):
+        p = Path(os.environ[env_name])
+        if not p.exists():
+            raise FileNotFoundError(f"{env_name} points to a missing file: {p}")
+        return p
+
+    candidates = []
+    for folder in MODEL_DIRS:
+        if not folder.exists():
+            continue
+        for p in folder.rglob("*"):
+            name = p.name.lower()
+            if (p.is_file() and p.suffix.lower() in MODEL_EXTENSIONS
+                    and kind in name and not any(w in name for w in SKIP_WORDS)):
+                candidates.append(p)
+
+    if not candidates:
+        searched = ", ".join(str(d) for d in MODEL_DIRS)
+        raise FileNotFoundError(
+            f"No {kind.upper()} model file found. Searched: {searched}. "
+            f"Put the file there with '{kind}' in its name, or set {env_name}.")
+
+    # Prefer files that look like XGBoost models, then sort by name for stability.
+    candidates.sort(key=lambda p: ("xgb" not in p.name.lower(), str(p)))
+    return candidates[0]
+
+
+def _unpack(obj):
+    """Return (final_estimator, preprocessing_or_None, feature_names_or_None)."""
+    features = None
+    if isinstance(obj, dict):
+        for key in ("features", "feature_names", "columns"):
+            if obj.get(key) is not None:
+                features = list(obj[key])
+                break
+        model = None
+        for key in ("model", "clf", "classifier", "pipeline", "estimator"):
+            if key in obj:
+                model = obj[key]
+                break
+        if model is None:
+            raise ValueError("Model file is a dict but has no 'model' key.")
+        obj = model
+
+    pre, final = None, obj
+    if hasattr(obj, "steps"):  # sklearn Pipeline
+        final = obj.steps[-1][1]
+        pre = obj[:-1] if len(obj.steps) > 1 else None
+    return final, pre, features
+
+
+@lru_cache(maxsize=None)
+def get_bundle(kind):
+    path = _find_model_file(kind)
+    print(f"[{kind}] loading model: {path}")
+
+    if path.suffix.lower() in (".json", ".ubj"):
+        from xgboost import XGBClassifier
+        final = XGBClassifier()
+        final.load_model(str(path))
+        pre, features = None, None
+    else:
+        final, pre, features = _unpack(joblib.load(path))
+
+    if features is None:
+        features = getattr(final, "feature_names_in_", None)
+        if features is not None:
+            features = list(features)
+    if features is None:
+        try:
+            features = list(final.get_booster().feature_names or [])
+        except Exception:
+            features = None
+    if not features:
+        features = DEFAULT_FEATURES[kind]
+
+    explainer = shap.TreeExplainer(final)
+    return {"path": path, "model": final, "pre": pre,
+            "features": features, "explainer": explainer}
+
+
+# ---------------- Scoring ----------------
+def score(kind, payload, threshold):
     try:
-        return st.secrets[key]
-    except Exception:
-        return default
+        b = get_bundle(kind)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load {kind} model: {e}")
 
+    row = payload.model_dump()
+    missing = [f for f in b["features"] if f not in row]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Model expects features the request does not have: {missing}")
 
-# API address: local lo default, deploy appudu Secrets / environment variable nundi vastundi
-API_BASE = _cfg("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-API_URL = f"{API_BASE}/predict"
-CARD_API_URL = f"{API_BASE}/predict-card"
-ADMIN_USERNAME = _cfg("ADMIN_USERNAME").strip().lower()
-API_TIMEOUT = 90  # free hosting lo API sleep nundi lechestappudu time paduthundi
+    X = pd.DataFrame([[row[f] for f in b["features"]]], columns=b["features"])
+    X_in = b["pre"].transform(X) if b["pre"] is not None else X
 
-DB = "data/app.db"
-THRESHOLD = 0.5
+    prob = float(b["model"].predict_proba(X_in)[0][1])
 
-REASON_TEXT = {
-    "device_changed": "Kotha device nundi transaction",
-    "new_receiver": "Kotha receiver (mundu pay cheyaledu)",
-    "location_mismatch": "Usual location kaadu",
-    "amount": "Amount chala ekkuva",
-    "hour": "Raatri time lo transaction",
-    "account_age_days": "Account chala kotha",
-    "txn_count_24h": "24 gantallo chala transactions",
-}
+    sv = b["explainer"].shap_values(X_in)
+    if isinstance(sv, list):          # older shap: [class0, class1]
+        sv = sv[1]
+    sv = np.asarray(sv)
+    if sv.ndim == 3:                  # newer shap: (n, features, classes)
+        sv = sv[:, :, 1]
+    impacts = sv[0]
 
-CATEGORIES = {"Grocery": 0.0, "Restaurant": 0.1, "Fuel": 0.2, "ATM": 0.4,
-              "Travel": 0.5, "Online shopping": 0.6, "Electronics": 0.8,
-              "Jewellery": 1.0}
-CITIES = {"Hyderabad": (17.385, 78.487), "Bengaluru": (12.972, 77.595),
-          "Mumbai": (19.076, 72.878), "Chennai": (13.083, 80.271),
-          "Delhi": (28.614, 77.209)}
+    names = b["features"] if len(b["features"]) == len(impacts) else \
+        [f"feature_{i}" for i in range(len(impacts))]
 
-CARD_REASON_TEXT = {
-    "amount_vs_avg": "Mee normal spending kante chala ekkuva amount",
-    "amount": "Amount chala ekkuva",
-    "txn_count_1h": "Oka gantalo chala transactions",
-    "minutes_since_last": "Last transaction ki chala daggara time lo",
-    "distance_from_last_km": "Last transaction nundi chala dooram",
-    "travel_speed_kmh": "Impossible travel (anta speed lo travel saadhyam kaadu)",
-    "merchant_risk": "Risky merchant category",
-    "is_online": "Online payment (card present kaadu)",
-    "is_foreign": "International merchant",
-}
+    reasons = [{"feature": n, "impact": float(v)} for n, v in zip(names, impacts)]
+    reasons.sort(key=lambda x: x["impact"], reverse=True)  # most risk-increasing first
 
-st.set_page_config(page_title="SecurePay", layout="wide")
-st.markdown("""
-<style>
-.block-container {padding-top: 2rem;}
-.hero {background: linear-gradient(135deg,#4F46E5,#7C3AED); padding: 28px 32px;
-       border-radius: 16px; margin-bottom: 20px;}
-.hero h1 {color: #fff; margin: 0; font-size: 2rem;}
-.hero p {color: #E0E7FF; margin: 6px 0 0 0;}
-div[data-testid="stMetric"] {background: #fff; border: 1px solid #E5E7EB;
-       border-left: 5px solid #4F46E5; padding: 14px 18px; border-radius: 12px;
-       box-shadow: 0 1px 3px rgba(0,0,0,.06);}
-.result-card {padding: 22px; border-radius: 14px; margin: 12px 0;}
-.result-card h2 {color: #fff; margin: 0;}
-.result-card p {color: #fff; margin: 4px 0 0 0;}
-.fraud {background: linear-gradient(135deg,#DC2626,#F97316);}
-.normal {background: linear-gradient(135deg,#059669,#10B981);}
-</style>
-<div class="hero">
-  <h1>💳 SecurePay</h1>
-  <p>Real-time UPI and card fraud protection with explainable AI</p>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ---------------- Database ----------------
-def db():
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE, salt TEXT, pw_hash TEXT,
-            role TEXT, created_at TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT, receiver TEXT, amount REAL, created_at TEXT,
-            fraud_probability REAL, decision TEXT, top_reason TEXT, status TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS card_transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT, merchant TEXT, category TEXT, city TEXT, amount REAL,
-            created_at TEXT, fraud_probability REAL, status TEXT, top_reason TEXT)""")
-
-
-init_db()
-
-
-# ---------------- Auth ----------------
-def hash_pw(pw, salt):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
-
-
-def register(username, pw):
-    username = username.strip().lower()
-    if len(username) < 3 or len(pw) < 6:
-        return False, "Username min 3 characters, password min 6 characters undali."
-    salt = secrets.token_hex(8)
-    with db() as c:
-        if c.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            return False, "Ee username already undi."
-        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        # ADMIN_USERNAME set chesthe aa username matrame admin. Lekapothe first user admin.
-        is_first_admin = (username == ADMIN_USERNAME) if ADMIN_USERNAME else (n == 0)
-        role = "admin" if is_first_admin else "user"
-        c.execute(
-            "INSERT INTO users(username,salt,pw_hash,role,created_at) VALUES(?,?,?,?,?)",
-            (username, salt, hash_pw(pw, salt), role,
-             datetime.now().isoformat(timespec="seconds")),
-        )
-    return True, f"Account create ayyindi (role: {role}). Ippudu Login tab lo login cheyandi."
-
-
-def login(username, pw):
-    username = username.strip().lower()
-    with db() as c:
-        row = c.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-    if row and secrets.compare_digest(row["pw_hash"], hash_pw(pw, row["salt"])):
-        return dict(row)
-    return None
-
-
-# ---------------- UPI payments ----------------
-def build_features(user, receiver, amount, device_changed, location_mismatch):
-    now = datetime.now()
-    created = datetime.fromisoformat(user["created_at"])
-    since = (now - timedelta(hours=24)).isoformat(timespec="seconds")
-    with db() as c:
-        cnt = c.execute(
-            "SELECT COUNT(*) FROM transactions WHERE username=? AND created_at>=?",
-            (user["username"], since)).fetchone()[0]
-        seen = c.execute(
-            "SELECT 1 FROM transactions WHERE username=? AND receiver=?",
-            (user["username"], receiver)).fetchone()
     return {
-        "amount": float(amount),
-        "hour": now.hour,
-        "account_age_days": max(1, (now - created).days),
-        "txn_count_24h": int(cnt),
-        "new_receiver": 0 if seen else 1,
-        "device_changed": int(device_changed),
-        "location_mismatch": int(location_mismatch),
+        "fraud_probability": prob,
+        "decision": "FRAUD" if prob >= threshold else "NORMAL",
+        "threshold": threshold,
+        "top_reasons": reasons[:5],
     }
 
 
-def send_money(user, receiver, amount, device_changed, location_mismatch):
-    feats = build_features(user, receiver, amount, device_changed, location_mismatch)
-    resp = requests.post(f"{API_URL}?threshold={THRESHOLD}", json=feats, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    r = resp.json()
-    status = "BLOCKED" if r["decision"] == "FRAUD" else "APPROVED"
-    with db() as c:
-        c.execute(
-            """INSERT INTO transactions(username,receiver,amount,created_at,
-               fraud_probability,decision,top_reason,status) VALUES(?,?,?,?,?,?,?,?)""",
-            (user["username"], receiver, float(amount),
-             datetime.now().isoformat(timespec="seconds"),
-             r["fraud_probability"], r["decision"],
-             r["top_reasons"][0]["feature"], status),
-        )
-    return r, status
+# ---------------- Routes ----------------
+@app.get("/")
+def root():
+    return {"service": "SecurePay Fraud API", "status": "running",
+            "docs": "/docs", "endpoints": ["/predict", "/predict-card", "/health"]}
 
 
-def load_txns(username=None):
-    with db() as c:
-        if username:
-            q, p = "SELECT * FROM transactions WHERE username=? ORDER BY id DESC", (username,)
-        else:
-            q, p = "SELECT * FROM transactions ORDER BY id DESC", ()
-        return pd.read_sql_query(q, c, params=p)
+@app.get("/health")
+def health():
+    info = {}
+    for kind in ("upi", "card"):
+        try:
+            b = get_bundle(kind)
+            info[kind] = {"ok": True, "file": str(b["path"]), "features": b["features"]}
+        except Exception as e:
+            info[kind] = {"ok": False, "error": str(e)}
+    return info
 
 
-# ---------------- Card payments ----------------
-def haversine(a, b):
-    lat1, lon1 = map(math.radians, a)
-    lat2, lon2 = map(math.radians, b)
-    d = (math.sin((lat2 - lat1) / 2) ** 2
-         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
-    return 6371 * 2 * math.asin(math.sqrt(d))
+@app.post("/predict")
+def predict_upi(txn: UpiTxn, threshold: float = Query(0.5, ge=0.0, le=1.0)):
+    return score("upi", txn, threshold)
 
 
-def build_card_features(user, category, city, amount, online, foreign):
-    now = datetime.now()
-    since = (now - timedelta(hours=1)).isoformat(timespec="seconds")
-    with db() as c:
-        cnt = c.execute(
-            "SELECT COUNT(*) FROM card_transactions WHERE username=? AND created_at>=?",
-            (user["username"], since)).fetchone()[0]
-        avg = c.execute(
-            "SELECT AVG(amount) FROM card_transactions WHERE username=? AND status='APPROVED'",
-            (user["username"],)).fetchone()[0]
-        last = c.execute(
-            "SELECT city, created_at FROM card_transactions "
-            "WHERE username=? AND status='APPROVED' ORDER BY id DESC LIMIT 1",
-            (user["username"],)).fetchone()
-
-    if last:
-        minutes = (now - datetime.fromisoformat(last["created_at"])).total_seconds() / 60
-        minutes = min(max(minutes, 1.0), 10080.0)
-        dist = haversine(CITIES[last["city"]], CITIES[city])
-    else:
-        minutes, dist = 1440.0, 0.0
-
-    return {
-        "amount": float(amount),
-        "amount_vs_avg": float(amount / avg) if avg else 1.0,
-        "txn_count_1h": int(cnt),
-        "minutes_since_last": round(minutes, 1),
-        "distance_from_last_km": round(dist, 1),
-        "travel_speed_kmh": round(min(dist / (minutes / 60), 3000.0), 1),
-        "merchant_risk": CATEGORIES[category],
-        "is_online": int(online),
-        "is_foreign": int(foreign),
-    }
-
-
-def card_pay(user, merchant, category, city, amount, online, foreign):
-    feats = build_card_features(user, category, city, amount, online, foreign)
-    resp = requests.post(f"{CARD_API_URL}?threshold={THRESHOLD}", json=feats, timeout=API_TIMEOUT)
-    resp.raise_for_status()
-    r = resp.json()
-    status = "BLOCKED" if r["decision"] == "FRAUD" else "APPROVED"
-    with db() as c:
-        c.execute(
-            """INSERT INTO card_transactions(username,merchant,category,city,amount,
-               created_at,fraud_probability,status,top_reason) VALUES(?,?,?,?,?,?,?,?,?)""",
-            (user["username"], merchant, category, city, float(amount),
-             datetime.now().isoformat(timespec="seconds"),
-             r["fraud_probability"], status, r["top_reasons"][0]["feature"]),
-        )
-    return r, status, feats
-
-
-def load_card_txns(username=None):
-    with db() as c:
-        if username:
-            q, p = "SELECT * FROM card_transactions WHERE username=? ORDER BY id DESC", (username,)
-        else:
-            q, p = "SELECT * FROM card_transactions ORDER BY id DESC", ()
-        return pd.read_sql_query(q, c, params=p)
-
-
-def result_card(fraud, title_fraud, text_fraud, title_ok, text_ok):
-    cls, title, text = ("fraud", title_fraud, text_fraud) if fraud else ("normal", title_ok, text_ok)
-    st.markdown(f'<div class="result-card {cls}"><h2>{title}</h2><p>{text}</p></div>',
-                unsafe_allow_html=True)
-
-
-# ---------------- Login screen ----------------
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-if st.session_state.user is None:
-    _, mid, _ = st.columns([1, 1.2, 1])
-    with mid:
-        t_login, t_reg = st.tabs(["Login", "Register"])
-        with t_login:
-            with st.form("login_form"):
-                u = st.text_input("Username")
-                p = st.text_input("Password", type="password")
-                if st.form_submit_button("Login", type="primary"):
-                    user = login(u, p)
-                    if user:
-                        st.session_state.user = user
-                        st.rerun()
-                    else:
-                        st.error("Username ledha password tappu.")
-        with t_reg:
-            with st.form("reg_form"):
-                u2 = st.text_input("Choose username")
-                p2 = st.text_input("Choose password", type="password")
-                st.caption("Demo app: asalu password pettakandi, dummy password vadandi.")
-                if st.form_submit_button("Create account"):
-                    ok, msg = register(u2, p2)
-                    (st.success if ok else st.error)(msg)
-    st.stop()
-
-
-# ---------------- Logged-in app ----------------
-user = st.session_state.user
-is_admin = user["role"] == "admin"
-
-with st.sidebar:
-    st.markdown(f"### 👤 {user['username']}")
-    st.caption(f"Role: {user['role']}")
-    if st.button("Logout"):
-        st.session_state.user = None
-        st.rerun()
-
-names = ["Send Money (UPI)", "Card Payment", "My Transactions"]
-if is_admin:
-    names.append("Admin Monitor")
-tabs = st.tabs(names)
-
-# ----- UPI: send money -----
-with tabs[0]:
-    left, right = st.columns([1, 1.2], gap="large")
-    with left:
-        st.subheader("Send money")
-        with st.form("send_form"):
-            receiver = st.text_input("Receiver (UPI ID / name)")
-            amount = st.number_input("Amount (Rs)", 1.0, 1_000_000.0, 500.0, key="upi_amount")
-            st.caption("Demo kosam: device mariyu location manual ga simulate chestam.")
-            dev = st.checkbox("New device nundi login (simulate)")
-            loc = st.checkbox("Different location nundi (simulate)")
-            go = st.form_submit_button("Pay now", type="primary")
-
-    with right:
-        st.subheader("Result")
-        if go:
-            if not receiver.strip():
-                st.warning("Receiver enter cheyandi.")
-            else:
-                try:
-                    with st.spinner("Checking transaction... (first request ki konchem time paduthundi)"):
-                        r, status = send_money(user, receiver.strip().lower(), amount, dev, loc)
-                except Exception as e:
-                    st.error(f"Fraud API ki connect avvaledu. Konchem sepu aagi malli try cheyandi. ({e})")
-                else:
-                    m1, m2 = st.columns(2)
-                    m1.metric("Fraud probability", f"{r['fraud_probability']:.1%}")
-                    m2.metric("Status", status)
-                    result_card(status == "BLOCKED",
-                                "🚨 TRANSACTION BLOCKED",
-                                "Suspicious activity detect ayyindi. Money pampabadaledu.",
-                                "✅ PAYMENT SUCCESSFUL",
-                                f"Rs {amount:,.2f} pampabadindi.")
-                    risky = [x for x in r["top_reasons"] if x["impact"] > 0]
-                    if risky:
-                        st.markdown("**Enduku ee risk?**")
-                        for x in risky:
-                            st.write("⚠️", REASON_TEXT.get(x["feature"], x["feature"]))
-        else:
-            st.info("Details enter chesi 'Pay now' click cheyandi.")
-
-# ----- Card payment -----
-with tabs[1]:
-    left, right = st.columns([1, 1.2], gap="large")
-    with left:
-        st.subheader("Card payment")
-        with st.form("card_form"):
-            merchant = st.text_input("Merchant name")
-            category = st.selectbox("Merchant category", list(CATEGORIES.keys()))
-            city = st.selectbox("Transaction city", list(CITIES.keys()))
-            c_amount = st.number_input("Amount (Rs)", 1.0, 1_000_000.0, 1500.0, key="card_amount")
-            online = st.checkbox("Online payment (card present kaadu)")
-            foreign = st.checkbox("International merchant")
-            pay = st.form_submit_button("Pay by card", type="primary")
-
-    with right:
-        st.subheader("Result")
-        if pay:
-            if not merchant.strip():
-                st.warning("Merchant name enter cheyandi.")
-            else:
-                try:
-                    with st.spinner("Checking card payment... (first request ki konchem time paduthundi)"):
-                        r, status, feats = card_pay(user, merchant.strip(), category, city,
-                                                    c_amount, online, foreign)
-                except Exception as e:
-                    st.error(f"Fraud API ki connect avvaledu. Konchem sepu aagi malli try cheyandi. ({e})")
-                else:
-                    m1, m2 = st.columns(2)
-                    m1.metric("Fraud probability", f"{r['fraud_probability']:.1%}")
-                    m2.metric("Status", status)
-                    result_card(status == "BLOCKED",
-                                "🚨 CARD PAYMENT BLOCKED",
-                                "Suspicious activity detect ayyindi.",
-                                "✅ CARD PAYMENT APPROVED",
-                                f"Rs {c_amount:,.2f} charge ayyindi.")
-                    risky = [x for x in r["top_reasons"] if x["impact"] > 0]
-                    if risky:
-                        st.markdown("**Enduku ee risk?**")
-                        for x in risky:
-                            st.write("⚠️", CARD_REASON_TEXT.get(x["feature"], x["feature"]))
-                    st.markdown("**Automatic ga calculate ayina features**")
-                    st.dataframe(
-                        pd.DataFrame({"Feature": list(feats.keys()),
-                                      "Value": [round(v, 2) for v in feats.values()]}),
-                        hide_index=True, use_container_width=True)
-        else:
-            st.info("Details enter chesi 'Pay by card' click cheyandi.")
-
-# ----- My transactions -----
-with tabs[2]:
-    st.subheader("My UPI transactions")
-    mine = load_txns(user["username"])
-    if mine.empty:
-        st.info("Inka UPI transactions levu.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total", len(mine))
-        c2.metric("Approved", int((mine["status"] == "APPROVED").sum()))
-        c3.metric("Blocked", int((mine["status"] == "BLOCKED").sum()))
-        st.dataframe(
-            mine[["created_at", "receiver", "amount", "status", "fraud_probability", "top_reason"]],
-            hide_index=True, use_container_width=True)
-
-    st.subheader("My card transactions")
-    mine_c = load_card_txns(user["username"])
-    if mine_c.empty:
-        st.info("Inka card transactions levu.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total", len(mine_c))
-        c2.metric("Approved", int((mine_c["status"] == "APPROVED").sum()))
-        c3.metric("Blocked", int((mine_c["status"] == "BLOCKED").sum()))
-        st.dataframe(
-            mine_c[["created_at", "merchant", "category", "city", "amount",
-                    "status", "fraud_probability", "top_reason"]],
-            hide_index=True, use_container_width=True)
-
-# ----- Admin monitor -----
-if is_admin:
-    with tabs[3]:
-        st.subheader("Admin monitor (all users)")
-        with db() as c:
-            n_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        st.metric("Users", n_users)
-
-        for label, data, cols in [
-            ("UPI", load_txns(),
-             ["created_at", "username", "receiver", "amount", "fraud_probability", "top_reason"]),
-            ("Card", load_card_txns(),
-             ["created_at", "username", "merchant", "city", "amount", "fraud_probability", "top_reason"]),
-        ]:
-            st.markdown(f"### {label} transactions")
-            if data.empty:
-                st.info(f"Inka {label} transactions levu.")
-                continue
-            blocked = data[data["status"] == "BLOCKED"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Transactions", len(data))
-            c2.metric("Blocked", len(blocked))
-            c3.metric("Fraud rate", f"{len(blocked) / len(data):.1%}")
-            if blocked.empty:
-                st.info("Inka blocked transactions levu.")
-            else:
-                st.dataframe(blocked[cols], hide_index=True, use_container_width=True)
-                st.bar_chart(blocked["top_reason"].value_counts(), color="#EF4444")
+@app.post("/predict-card")
+def predict_card(txn: CardTxn, threshold: float = Query(0.5, ge=0.0, le=1.0)):
+    return score("card", txn, threshold)
