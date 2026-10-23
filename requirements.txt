@@ -1,3 +1,8 @@
-pandas==3.0.6
-requests==2.34.2
-streamlit==1.66.0
+streamlit
+pandas
+numpy
+requests
+joblib
+scikit-learn
+xgboost
+shap

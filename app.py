@@ -25,11 +25,14 @@ def _cfg(key, default=""):
 ADMIN_USERNAME = _cfg("ADMIN_USERNAME").strip().lower()
 
 # Address of the FastAPI service (api/main.py)
-API_URL = _cfg("API_URL", "http://127.0.0.1:8000").rstrip("/")
+API_URL = _cfg("API_URL", "").rstrip("/")  # leave empty to score inside the app (Streamlit Cloud)
 
 
 def fraud_score(kind, feats, threshold):
-    """Send the features to the FastAPI service and return its JSON result."""
+    """Score via the FastAPI service if API_URL is set, otherwise score inside the app."""
+    if not API_URL:
+        from fraud_engine import score
+        return score(kind, feats, threshold)
     path = "/predict" if kind == "upi" else "/predict-card"
     try:
         resp = requests.post(f"{API_URL}{path}", params={"threshold": threshold},
