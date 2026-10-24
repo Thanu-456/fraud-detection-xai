@@ -5,4 +5,4 @@ requests
 joblib
 scikit-learn
 xgboost
-shap
+shapF

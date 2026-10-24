@@ -345,14 +345,14 @@ tabs = st.tabs(names)
 with tabs[0]:
     left, right = st.columns([1, 1.2], gap="large")
     with left:
-        st.subheader("Send money")
+        st.subheader("UPI Fraud Test")
         with st.form("send_form"):
-            receiver = st.text_input("Receiver (UPI ID / name)")
+            receiver = st.text_input("Test Receiver ID")
             amount = st.number_input("Amount (Rs)", 1.0, 1_000_000.0, 500.0, key="upi_amount")
             st.caption("For the demo, device and location are simulated manually.")
-            dev = st.checkbox("Login from a new device (simulate)")
-            loc = st.checkbox("Login from a different location (simulate)")
-            go = st.form_submit_button("Pay now", type="primary")
+            dev = st.checkbox("Simulate New Device Login (simulate)")
+            loc = st.checkbox("Simulate Location Change (simulate)")
+            go = st.form_submit_button("Analyze Transaction", type="primary")
 
     with right:
         st.subheader("Result")
@@ -370,8 +370,8 @@ with tabs[0]:
                     m1.metric("Fraud probability", f"{r['fraud_probability']:.1%}")
                     m2.metric("Status", status)
                     result_card(status == "BLOCKED",
-                                "🚨 TRANSACTION BLOCKED",
-                                "Suspicious activity detected. The money was not sent.",
+                                "🚨 This was a fraud detection simulation.",
+                                "Suspicious activity detected. This was a fraud detection simulation..",
                                 "✅ PAYMENT SUCCESSFUL",
                                 f"Rs {amount:,.2f} has been sent.")
                     risky = [x for x in r["top_reasons"] if x["impact"] > 0]
@@ -380,13 +380,13 @@ with tabs[0]:
                         for x in risky:
                             st.write("⚠️", REASON_TEXT.get(x["feature"], x["feature"]))
         else:
-            st.info("Enter the details and click 'Pay now'.")
+            st.info("Enter the details and click 'Analyze Transaction'.")
 
 # ----- Card payment -----
 with tabs[1]:
     left, right = st.columns([1, 1.2], gap="large")
     with left:
-        st.subheader("Card payment")
+        st.subheader("Card Fraud Test")
         with st.form("card_form"):
             merchant = st.text_input("Merchant name")
             category = st.selectbox("Merchant category", list(CATEGORIES.keys()))
@@ -394,7 +394,7 @@ with tabs[1]:
             c_amount = st.number_input("Amount (Rs)", 1.0, 1_000_000.0, 1500.0, key="card_amount")
             online = st.checkbox("Online payment (card not present)")
             foreign = st.checkbox("International merchant")
-            pay = st.form_submit_button("Pay by card", type="primary")
+            pay = st.form_submit_button("Analyze Card Transaction", type="primary")
 
     with right:
         st.subheader("Result")
@@ -428,7 +428,7 @@ with tabs[1]:
                                       "Value": [round(v, 2) for v in feats.values()]}),
                         hide_index=True, use_container_width=True)
         else:
-            st.info("Enter the details and click 'Pay by card'.")
+            st.info("Enter the details and click 'Analyze Card Transaction'.")
 
 # ----- My transactions -----
 with tabs[2]:

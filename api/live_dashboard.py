@@ -48,7 +48,7 @@ def live():
 
     left, right = st.columns(2, gap="large")
     with left:
-        st.subheader("Fraud probability (last 50 transactions)")
+        st.subheader(" Estimated Fraud Risk(last 50 transactions)")
         st.line_chart(df.tail(50).reset_index(drop=True)["fraud_probability"],
                       color="#4F46E5")
     with right:
