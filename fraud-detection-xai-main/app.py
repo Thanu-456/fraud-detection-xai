@@ -108,10 +108,10 @@ div[data-testid="stMetric"] {background: #fff; border: 1px solid #E5E7EB;
 </style>
 <div class="hero">
   <h1>💳 SecurePay</h1>
-  <p>UPI and card fraud detection demo with explainable AI</p>
+  <p>Explainable Machine Learning for UPI and Credit Card Fraud Detection</p>
 </div>
 """, unsafe_allow_html=True)
-st.info("DEMO ONLY: Predictions are simulations. No real payment is made, charged, transferred, or blocked.")
+
 
 
 # ---------------- Database ----------------
