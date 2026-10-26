@@ -111,12 +111,12 @@ div[data-testid="stMetric"] {background: #fff; border: 1px solid #E5E7EB;
   <p>UPI and card fraud detection demo with explainable AI</p>
 </div>
 """, unsafe_allow_html=True)
-
+st.info("DEMO ONLY: Predictions are simulations. No real payment is made, charged, transferred, or blocked.")
 
 
 # ---------------- Database ----------------
 def db():
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
@@ -435,7 +435,7 @@ with tabs[1]:
                     st.dataframe(
                         pd.DataFrame({"Feature": list(feats.keys()),
                                       "Value": [round(v, 2) for v in feats.values()]}),
-                        hide_index=True, use_container_width=True)
+                        hide_index=True, width="stretch")
         else:
             st.info("Enter the details and click 'Analyze Card Transaction'.")
 
@@ -452,7 +452,7 @@ with tabs[2]:
         c3.metric("Potential Fraud", int((mine["status"] == "BLOCKED").sum()))
         mine_display = mine[["created_at", "receiver", "amount", "status", "fraud_probability", "top_reason"]].copy()
         mine_display["status"] = mine_display["status"].map(display_status)
-        st.dataframe(mine_display, hide_index=True, use_container_width=True)
+        st.dataframe(mine_display, hide_index=True, width="stretch")
 
     st.subheader("My card transactions")
     mine_c = load_card_txns(user["username"])
@@ -466,7 +466,7 @@ with tabs[2]:
         mine_c_display = mine_c[["created_at", "merchant", "category", "city", "amount",
                                  "status", "fraud_probability", "top_reason"]].copy()
         mine_c_display["status"] = mine_c_display["status"].map(display_status)
-        st.dataframe(mine_c_display, hide_index=True, use_container_width=True)
+        st.dataframe(mine_c_display, hide_index=True, width="stretch")
 
 # ----- Admin monitor -----
 if is_admin:
@@ -494,5 +494,5 @@ if is_admin:
             if blocked.empty:
                 st.info("No potentially fraudulent demo transactions have been flagged yet.")
             else:
-                st.dataframe(blocked[cols], hide_index=True, use_container_width=True)
+                st.dataframe(blocked[cols], hide_index=True, width="stretch")
                 st.bar_chart(blocked["top_reason"].value_counts(), color="#EF4444")
