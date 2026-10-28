@@ -2,7 +2,7 @@
 ## Live demo
 https://securepay-fraud.streamlit.app/
 
-Free hosting valla first request ki ~1 minute paduthundi (API sleep nundi lestundi). Demo app: money fake, dummy password vadandi.
+
 
 ![Approved](reports/figures/app_approved.png)
 ![Blocked](reports/figures/app_blocked.png)
