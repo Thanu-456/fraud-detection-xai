@@ -47,7 +47,7 @@ Logistic Regression catches most fraud but flags too many normal transactions (p
 | `api/simulator.py` + `api/live_dashboard.py` | `python api/simulator.py`, `streamlit run api/live_dashboard.py` | Simulated transaction stream and live monitor |
 | `user_app.py` | `streamlit run user_app.py` | Login, send money, instant APPROVED/BLOCKED decision with reasons, admin monitor |
 
-![Dashboard](reports/figures/app_fraud.png)
+
 
 ## Project structure
 ```
