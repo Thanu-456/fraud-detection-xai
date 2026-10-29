@@ -4,8 +4,7 @@ https://securepay-fraud.streamlit.app/
 
 
 
-![Approved](reports/figures/app_approved.png)
-![Blocked](reports/figures/app_blocked.png)
+
 
 Fraud detection with XGBoost and SHAP, plus a simulated real-time scoring flow (FastAPI + Streamlit) where users log in, send money, and see why a transaction was approved or blocked.
 
@@ -39,12 +38,6 @@ Fraud is rare (0.17% of card transactions in the dataset used here), so accuracy
 
 Logistic Regression catches most fraud but flags too many normal transactions (precision 0.061), so XGBoost is the best overall.
 
-### UPI data (synthetic)
-(Paste your table from `reports/upi_model_results.csv` here)
-
-## Explainability (SHAP)
-![UPI SHAP summary](reports/figures/upi_shap_summary.png)
-![UPI SHAP waterfall](reports/figures/upi_shap_waterfall.png)
 
 ## Demo apps
 | App | Run | What it does |
